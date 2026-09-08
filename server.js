@@ -4,45 +4,585 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
-
-const authRoutes = require("./routes/auth");
-const storeRoutes = require("./routes/stores");
-const productRoutes = require("./routes/products");
-const planRoutes = require("./routes/plans");
-const affiliateRoutes = require("./routes/affiliates");
-const adRoutes = require("./routes/ads");
-const userRoutes = require("./routes/users");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
+const { body, validationResult } = require("express-validator");
 
 const app = express();
 
-// --- Segurança básica ---
+/* ============================================================
+   PLANOS — fonte única da verdade para limites e preços
+   ============================================================ */
+const PLAN_LIMITS = {
+  starter: { maxStores: 1, maxProducts: 5, priceCents: 900, hasAds: true },
+  growth: { maxStores: 1, maxProducts: Infinity, priceCents: 2900, hasAds: false },
+  pro: { maxStores: Infinity, maxProducts: Infinity, priceCents: 5900, hasAds: false },
+};
+
+/* ============================================================
+   TRIAL — primeiros 3 dias de cada conta contam como Pro
+   ============================================================ */
+function effectivePlanId(user) {
+  const trialActive = user.trial_ends_at && new Date(user.trial_ends_at) > new Date();
+  return trialActive ? "pro" : user.plan;
+}
+function isTrialActive(user) {
+  return !!(user.trial_ends_at && new Date(user.trial_ends_at) > new Date());
+}
+
+/* ============================================================
+   MIDDLEWARE DE AUTENTICAÇÃO
+   ============================================================ */
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Sessão não encontrada. Inicia sessão novamente." });
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Sessão inválida ou expirada." });
+  }
+}
+
+async function requireStoreOwner(req, res, next) {
+  const db = req.app.get("db");
+  const { storeId } = req.params;
+  const { rows } = await db.query("SELECT owner_id FROM stores WHERE id = $1", [storeId]);
+  if (rows.length === 0) return res.status(404).json({ error: "Loja não encontrada." });
+  if (rows[0].owner_id !== req.userId) return res.status(403).json({ error: "Sem permissão para esta loja." });
+  next();
+}
+
+function slugify(s) {
+  return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+/* ============================================================
+   SEGURANÇA GLOBAL
+   ============================================================ */
 app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*", credentials: true }));
-app.use(express.json({ limit: "2mb" })); // limite de tamanho do corpo do pedido
 
-// Limita pedidos por IP para evitar abuso/força-bruta
-const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
-app.use(globalLimiter);
+// O webhook da Stripe precisa do corpo em bruto para verificar a assinatura
+app.use("/api/billing/webhook", express.raw({ type: "application/json" }));
+app.use(express.json({ limit: "2mb" }));
 
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }); // mais apertado no login/registo
-app.use("/api/auth", authLimiter);
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
+const assistantLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 30 });
 
-// --- Base de dados ---
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 app.set("db", pool);
 
-// --- Rotas ---
-app.use("/api/auth", authRoutes);
-app.use("/api/stores", storeRoutes);
-app.use("/api/stores/:storeId/products", productRoutes);
-app.use("/api/plans", planRoutes);
-app.use("/api/affiliates", affiliateRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api", adRoutes); // define as próprias rotas /api/stores/:id/ad-events e /api/ads/stats
+/* ============================================================
+   AUTENTICAÇÃO — /api/auth
+   ============================================================ */
+app.post(
+  "/api/auth/register",
+  authLimiter,
+  [
+    body("name").trim().isLength({ min: 1, max: 120 }).withMessage("Nome obrigatório"),
+    body("email").isEmail().normalizeEmail().withMessage("Email inválido"),
+    body("password").isLength({ min: 8 }).withMessage("A password precisa de pelo menos 8 caracteres"),
+  ],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
+    const db = req.app.get("db");
+    const { name, email, password, ref } = req.body;
+
+    try {
+      const existing = await db.query("SELECT id FROM users WHERE email = $1", [email]);
+      if (existing.rows.length > 0) return res.status(409).json({ error: "Já existe uma conta com este email." });
+
+      const passwordHash = await bcrypt.hash(password, 12);
+      const affiliateCode = name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-" + crypto.randomBytes(3).toString("hex");
+
+      let referredBy = null;
+      if (ref) {
+        const refUser = await db.query("SELECT affiliate_code FROM users WHERE affiliate_code = $1", [ref]);
+        if (refUser.rows.length > 0) referredBy = ref;
+      }
+
+      const { rows } = await db.query(
+        `INSERT INTO users (name, email, password_hash, affiliate_code, referred_by)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, plan, affiliate_code, trial_ends_at`,
+        [name, email, passwordHash, affiliateCode, referredBy]
+      );
+
+      const user = rows[0];
+      const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "30d" });
+      res.status(201).json({ token, user });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.post(
+  "/api/auth/login",
+  authLimiter,
+  [body("email").isEmail().normalizeEmail(), body("password").notEmpty()],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Credenciais inválidas." });
+
+    const db = req.app.get("db");
+    const { email, password } = req.body;
+
+    try {
+      const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+      if (rows.length === 0) return res.status(401).json({ error: "Email ou password incorretos." });
+
+      const user = rows[0];
+      const valid = await bcrypt.compare(password, user.password_hash);
+      if (!valid) return res.status(401).json({ error: "Email ou password incorretos." });
+
+      const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "30d" });
+      delete user.password_hash;
+      res.json({ token, user });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* ============================================================
+   UTILIZADOR — /api/users
+   ============================================================ */
+app.get("/api/users/me", requireAuth, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const { rows } = await db.query(
+      "SELECT id, name, email, plan, affiliate_code, trial_ends_at FROM users WHERE id = $1",
+      [req.userId]
+    );
+    const user = rows[0];
+    res.json({ ...user, trialActive: isTrialActive(user), effectivePlan: effectivePlanId(user) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// ⚠️ Muda o plano sem cobrar — só para testar o fluxo antes da Stripe estar ligada
+app.post(
+  "/api/users/me/plan",
+  requireAuth,
+  [body("plan").isIn(Object.keys(PLAN_LIMITS)).withMessage("Plano inválido")],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+
+    const db = req.app.get("db");
+    try {
+      const { rows } = await db.query(
+        "UPDATE users SET plan = $1 WHERE id = $2 RETURNING id, name, email, plan",
+        [req.body.plan, req.userId]
+      );
+      res.json(rows[0]);
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* ============================================================
+   PLANOS — /api/plans
+   ============================================================ */
+app.get("/api/plans", (req, res) => {
+  res.json(
+    Object.entries(PLAN_LIMITS).map(([id, limits]) => ({
+      id,
+      priceCents: limits.priceCents,
+      maxStores: limits.maxStores === Infinity ? null : limits.maxStores,
+      maxProducts: limits.maxProducts === Infinity ? null : limits.maxProducts,
+      hasAds: limits.hasAds,
+    }))
+  );
+});
+
+/* ============================================================
+   LOJAS — /api/stores
+   ============================================================ */
+app.get("/api/stores", async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const { rows } = await db.query("SELECT * FROM stores WHERE is_demo = true ORDER BY id");
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/stores/mine", requireAuth, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const { rows } = await db.query("SELECT * FROM stores WHERE owner_id = $1 ORDER BY id DESC", [req.userId]);
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.post(
+  "/api/stores",
+  requireAuth,
+  [body("name").trim().isLength({ min: 1, max: 120 }), body("niche").trim().isLength({ min: 1, max: 40 })],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Dados inválidos." });
+
+    const db = req.app.get("db");
+    const { name, niche } = req.body;
+
+    try {
+      const userRes = await db.query("SELECT plan, trial_ends_at FROM users WHERE id = $1", [req.userId]);
+      const plan = effectivePlanId(userRes.rows[0]);
+      const countRes = await db.query("SELECT COUNT(*)::int AS n FROM stores WHERE owner_id = $1", [req.userId]);
+
+      if (countRes.rows[0].n >= PLAN_LIMITS[plan].maxStores) {
+        return res.status(403).json({ error: `Limite de lojas do plano ${plan} atingido. Faz upgrade para continuar.` });
+      }
+
+      const slug = slugify(name) + "-" + Math.floor(Math.random() * 9000 + 1000);
+      const { rows } = await db.query(
+        `INSERT INTO stores (owner_id, name, slug, niche) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [req.userId, name, slug, niche]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.delete("/api/stores/:storeId", requireAuth, requireStoreOwner, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    await db.query("DELETE FROM stores WHERE id = $1", [req.params.storeId]);
+    res.status(204).send();
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ============================================================
+   PRODUTOS — /api/stores/:storeId/products
+   ============================================================ */
+app.get("/api/stores/:storeId/products", async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const { rows } = await db.query("SELECT * FROM products WHERE store_id = $1 ORDER BY id", [req.params.storeId]);
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.post(
+  "/api/stores/:storeId/products",
+  requireAuth,
+  requireStoreOwner,
+  [
+    body("name").trim().isLength({ min: 1, max: 160 }),
+    body("price_cents").isInt({ min: 0, max: 100_000_000 }),
+    body("image_url").optional({ nullable: true }).isURL().withMessage("URL de imagem inválida"),
+  ],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+
+    const db = req.app.get("db");
+    const { storeId } = req.params;
+    const { name, price_cents, image_url } = req.body;
+
+    try {
+      const userRes = await db.query(
+        `SELECT u.plan, u.trial_ends_at FROM users u JOIN stores s ON s.owner_id = u.id WHERE s.id = $1`,
+        [storeId]
+      );
+      const plan = effectivePlanId(userRes.rows[0]);
+      const countRes = await db.query("SELECT COUNT(*)::int AS n FROM products WHERE store_id = $1", [storeId]);
+
+      if (countRes.rows[0].n >= PLAN_LIMITS[plan].maxProducts) {
+        return res.status(403).json({ error: `Limite de produtos do plano ${plan} atingido. Faz upgrade para continuar.` });
+      }
+
+      const { rows } = await db.query(
+        `INSERT INTO products (store_id, name, price_cents, image_url) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [storeId, name, price_cents, image_url || null]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.delete("/api/stores/:storeId/products/:productId", requireAuth, requireStoreOwner, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    await db.query("DELETE FROM products WHERE id = $1 AND store_id = $2", [req.params.productId, req.params.storeId]);
+    res.status(204).send();
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ============================================================
+   AFILIADOS — /api/affiliates
+   ============================================================ */
+app.get("/api/affiliates/me", requireAuth, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const userRes = await db.query("SELECT affiliate_code FROM users WHERE id = $1", [req.userId]);
+    const code = userRes.rows[0].affiliate_code;
+
+    const referredRes = await db.query(
+      "SELECT id, name, plan, created_at FROM users WHERE referred_by = $1 ORDER BY created_at DESC",
+      [code]
+    );
+    const referred = referredRes.rows;
+    const payingReferred = referred.filter((u) => u.plan !== "starter").length;
+
+    res.json({
+      code,
+      referralLink: `${process.env.FRONTEND_URL || "https://shopmartin.app"}/?ref=${code}`,
+      totalReferred: referred.length,
+      payingReferred,
+      referred,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ============================================================
+   ANÚNCIOS — /api/stores/:id/ad-events e /api/ads/stats
+   ============================================================ */
+const RATE_CENTS_PER_IMPRESSION = 0.4;
+
+app.post("/api/stores/:storeId/ad-events", async (req, res, next) => {
+  const db = req.app.get("db");
+  const { storeId } = req.params;
+  try {
+    const ownerRes = await db.query(
+      `SELECT u.plan, u.trial_ends_at FROM users u JOIN stores s ON s.owner_id = u.id WHERE s.id = $1`,
+      [storeId]
+    );
+    if (ownerRes.rows.length === 0) return res.status(404).json({ error: "Loja não encontrada." });
+
+    const plan = effectivePlanId(ownerRes.rows[0]);
+    if (!PLAN_LIMITS[plan].hasAds) return res.json({ tracked: false, reason: "Este plano não mostra anúncios." });
+
+    const revenueCents = Math.round(RATE_CENTS_PER_IMPRESSION);
+    await db.query("INSERT INTO ad_events (store_id, impressions, revenue_cents) VALUES ($1, 1, $2)", [storeId, revenueCents]);
+    res.json({ tracked: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/ads/stats", requireAuth, async (req, res, next) => {
+  const db = req.app.get("db");
+  try {
+    const { rows } = await db.query(
+      `SELECT COALESCE(SUM(ae.impressions), 0)::int AS impressions, COALESCE(SUM(ae.revenue_cents), 0)::int AS revenue_cents
+       FROM ad_events ae JOIN stores s ON s.id = ae.store_id WHERE s.owner_id = $1`,
+      [req.userId]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ============================================================
+   ASSISTENTE DE IA — /api/assistant/chat
+   ============================================================ */
+const SYSTEM_PROMPT = `És o assistente de apoio da ShopMartin, uma plataforma onde qualquer pessoa
+cria a sua loja virtual. Ajuda o utilizador com: ideias de produtos, textos para a loja (descrições,
+nomes), dúvidas sobre como usar a plataforma, e conselhos simples de vendas online. Sê direto,
+prático e escreve em português informal. Não inventes funcionalidades que a ShopMartin não tem.`;
+
+app.post(
+  "/api/assistant/chat",
+  requireAuth,
+  assistantLimiter,
+  [body("message").trim().isLength({ min: 1, max: 2000 }).withMessage("Escreve uma mensagem (até 2000 caracteres)")],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: "O assistente de IA ainda não está configurado neste servidor." });
+    }
+
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: 800,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: req.body.message }],
+        }),
+      });
+
+      if (!response.ok) {
+        console.error("Erro da API Anthropic:", await response.text());
+        return res.status(502).json({ error: "O assistente não respondeu. Tenta novamente." });
+      }
+
+      const data = await response.json();
+      const reply = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      res.json({ reply });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* ============================================================
+   FATURAÇÃO — /api/billing (Stripe)
+   ============================================================ */
+function getStripe() {
+  if (!process.env.STRIPE_SECRET_KEY) return null;
+  return require("stripe")(process.env.STRIPE_SECRET_KEY);
+}
+
+const STRIPE_PRICE_IDS = {
+  starter: process.env.STRIPE_PRICE_STARTER || "",
+  growth: process.env.STRIPE_PRICE_GROWTH || "",
+  pro: process.env.STRIPE_PRICE_PRO || "",
+};
+
+app.post(
+  "/api/billing/checkout",
+  requireAuth,
+  [body("plan").isIn(Object.keys(PLAN_LIMITS)).withMessage("Plano inválido")],
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(503).json({ error: "Pagamentos ainda não configurados neste servidor." });
+
+    const priceId = STRIPE_PRICE_IDS[req.body.plan];
+    if (!priceId) return res.status(503).json({ error: `Preço da Stripe para o plano ${req.body.plan} não configurado.` });
+
+    const db = req.app.get("db");
+    try {
+      const userRes = await db.query("SELECT email, stripe_customer_id FROM users WHERE id = $1", [req.userId]);
+      const user = userRes.rows[0];
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        customer: user.stripe_customer_id || undefined,
+        customer_email: user.stripe_customer_id ? undefined : user.email,
+        line_items: [{ price: priceId, quantity: 1 }],
+        success_url: (process.env.FRONTEND_URL || "https://shopmartin.app") + "/?checkout=success",
+        cancel_url: (process.env.FRONTEND_URL || "https://shopmartin.app") + "/?checkout=cancel",
+        client_reference_id: String(req.userId),
+        metadata: { userId: String(req.userId), plan: req.body.plan },
+      });
+
+      res.json({ url: session.url });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.post("/api/billing/webhook", async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(503).send("Stripe não configurada.");
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Assinatura do webhook inválida:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const db = req.app.get("db");
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata.userId;
+      const plan = session.metadata.plan;
+      await db.query("UPDATE users SET plan = $1, stripe_customer_id = $2 WHERE id = $3", [plan, session.customer, userId]);
+      await db.query(
+        `INSERT INTO subscriptions (user_id, plan, stripe_subscription_id, status) VALUES ($1, $2, $3, 'active')`,
+        [userId, plan, session.subscription]
+      );
+    }
+    if (event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      await db.query("UPDATE subscriptions SET status = 'canceled' WHERE stripe_subscription_id = $1", [sub.id]);
+      await db.query(`UPDATE users SET plan = 'starter' WHERE stripe_customer_id = $1`, [sub.customer]);
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error("Erro a processar webhook:", e);
+    res.status(500).send("Erro interno");
+  }
+});
+
+/* ============================================================
+   UPLOAD DE IMAGENS — /api/uploads (Cloudflare R2)
+   ============================================================ */
+app.post("/api/uploads/image-upload-url", requireAuth, async (req, res, next) => {
+  if (!process.env.R2_ACCOUNT_ID || !process.env.R2_ACCESS_KEY_ID) {
+    return res.status(503).json({ error: "Upload de imagens ainda não configurado neste servidor." });
+  }
+
+  const { contentType } = req.body;
+  const allowed = ["image/jpeg", "image/png", "image/webp"];
+  if (!allowed.includes(contentType)) {
+    return res.status(400).json({ error: "Tipo de imagem não suportado. Usa JPEG, PNG ou WebP." });
+  }
+
+  try {
+    const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+    const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+    const s3 = new S3Client({
+      region: "auto",
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
+    });
+
+    const ext = contentType.split("/")[1];
+    const key = `products/${req.userId}/${crypto.randomUUID()}.${ext}`;
+
+    const uploadUrl = await getSignedUrl(
+      s3,
+      new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key, ContentType: contentType }),
+      { expiresIn: 300 }
+    );
+
+    res.json({ uploadUrl, publicUrl: `${process.env.R2_PUBLIC_URL}/${key}` });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ============================================================
+   SAÚDE E ERROS
+   ============================================================ */
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// Handler de erro genérico — nunca devolve detalhes internos ao cliente
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(err.status || 500).json({ error: "Ocorreu um erro. Tenta novamente." });
