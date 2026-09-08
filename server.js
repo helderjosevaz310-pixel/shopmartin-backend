@@ -77,6 +77,87 @@ const assistantLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 30 });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 app.set("db", pool);
 
+// Cria as tabelas automaticamente se ainda não existirem — assim não é preciso
+// correr o schema.sql à mão. É seguro correr isto sempre que o servidor arranca.
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      plan VARCHAR(20) NOT NULL DEFAULT 'starter',
+      trial_ends_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '3 days'),
+      stripe_customer_id VARCHAR(120),
+      affiliate_code VARCHAR(40) UNIQUE,
+      referred_by VARCHAR(40),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS stores (
+      id SERIAL PRIMARY KEY,
+      owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name VARCHAR(120) NOT NULL,
+      slug VARCHAR(140) UNIQUE NOT NULL,
+      niche VARCHAR(40) NOT NULL,
+      is_demo BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      name VARCHAR(160) NOT NULL,
+      price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
+      currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+      image_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      plan VARCHAR(20) NOT NULL,
+      stripe_subscription_id VARCHAR(120),
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      current_period_end TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS ad_events (
+      id SERIAL PRIMARY KEY,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      impressions INTEGER NOT NULL DEFAULT 1,
+      revenue_cents INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_stores_owner ON stores(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_products_store ON products(store_id);
+    CREATE INDEX IF NOT EXISTS idx_ad_events_store ON ad_events(store_id);
+  `);
+
+  // Semeia 5 lojas de exemplo (só na primeira vez, se ainda não existir nenhuma)
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS n FROM stores WHERE is_demo = true");
+  if (rows[0].n === 0) {
+    const demoOwner = await pool.query(
+      `INSERT INTO users (name, email, password_hash, affiliate_code, plan)
+       VALUES ('ShopMartin Demo', 'demo@shopmartin.app', 'sem-login', 'demo-shopmartin', 'pro')
+       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`
+    );
+    const ownerId = demoOwner.rows[0].id;
+    const demoStores = [
+      ["Ateliê da Marta", "atelie-da-marta", "artesanato"],
+      ["Nôs Sabor", "nos-sabor", "comida"],
+      ["Studio Léa", "studio-lea", "moda"],
+      ["PixelKit Templates", "pixelkit-templates", "digital"],
+      ["Pele Natural", "pele-natural", "beleza"],
+    ];
+    for (const [name, slug, niche] of demoStores) {
+      await pool.query(
+        `INSERT INTO stores (owner_id, name, slug, niche, is_demo) VALUES ($1, $2, $3, $4, true) ON CONFLICT (slug) DO NOTHING`,
+        [ownerId, name, slug, niche]
+      );
+    }
+  }
+}
+
 /* ============================================================
    AUTENTICAÇÃO — /api/auth
    ============================================================ */
@@ -589,4 +670,11 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ShopMartin API a correr na porta ${PORT}`));
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log(`ShopMartin API a correr na porta ${PORT}`));
+  })
+  .catch((e) => {
+    console.error("Falha ao preparar a base de dados:", e);
+    process.exit(1);
+  });
