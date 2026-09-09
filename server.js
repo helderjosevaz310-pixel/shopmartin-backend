@@ -1,5 +1,5 @@
-    const ownerId = demoOwner.rows[0].id;
-    const demoStores = [
+const ownerId = demoOwner.rows[0].id;
+const demoStores = [
       ["Ateliê da Marta", "atelie-da-marta", "artesanato"],
       ["Nôs Sabor", "nos-sabor", "comida"],
       ["Studio Léa", "studio-lea", "moda"],
